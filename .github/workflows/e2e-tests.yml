@@ -1,4 +1,5 @@
-name: Main workflow
+name: e2e tests
+
 on:
   push:
     branches:
@@ -8,30 +9,17 @@ on:
   pull_request:
     paths-ignore:
       - '**.md'
+      
 jobs:
-  run:
-    name: Run
+  test-setup-python:
+    name: Test setup-python
     runs-on: ${{ matrix.operating-system }}
     strategy:
       matrix:
-        operating-system: [ubuntu-latest, windows-latest]
+        operating-system: [ubuntu-20.04, windows-latest]
     steps:
     - name: Checkout
-      uses: actions/checkout@v2
-
-    - name: Set Node.js 12.x
-      uses: actions/setup-node@v1
-      with:
-        node-version: 12.x
-
-    - name: npm install
-      run: npm install
-
-    - name: Lint
-      run: npm run format-check
-
-    - name: npm test
-      run: npm test
+      uses: actions/checkout@v3
 
     - name: Run with setup-python 2.7
       uses: ./
@@ -67,7 +55,7 @@ jobs:
         python-version: 3.8
     - name: Verify 3.8
       run: python __tests__/verify-python.py 3.8
-    
+
     - name: Run with setup-python 3.7.5
       uses: ./
       with:
@@ -88,3 +76,13 @@ jobs:
         python-version: 3.8.1
     - name: Verify 3.8.1
       run: python __tests__/verify-python.py 3.8.1
+
+    - name: Run with setup-python 3.10
+      id: cp310
+      uses: ./
+      with:
+        python-version: "3.10"
+    - name: Verify 3.10
+      run: python __tests__/verify-python.py 3.10
+    - name: Run python-path sample 3.10
+      run: pipx run --python '${{ steps.cp310.outputs.python-path }}' nox --version

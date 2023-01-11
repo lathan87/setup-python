@@ -6,7 +6,8 @@ import {
   validateVersion,
   getPyPyVersionFromPath,
   readExactPyPyVersionFile,
-  validatePythonVersionFormatForPyPy
+  validatePythonVersionFormatForPyPy,
+  IPyPyManifestRelease
 } from './utils';
 
 import * as semver from 'semver';
@@ -20,13 +21,40 @@ interface IPyPyVersionSpec {
 
 export async function findPyPyVersion(
   versionSpec: string,
-  architecture: string
+  architecture: string,
+  updateEnvironment: boolean,
+  checkLatest: boolean
 ): Promise<{resolvedPyPyVersion: string; resolvedPythonVersion: string}> {
   let resolvedPyPyVersion = '';
   let resolvedPythonVersion = '';
   let installDir: string | null;
+  let releases: IPyPyManifestRelease[] | undefined;
 
   const pypyVersionSpec = parsePyPyVersion(versionSpec);
+
+  if (checkLatest) {
+    releases = await pypyInstall.getAvailablePyPyVersions();
+    if (releases && releases.length > 0) {
+      const releaseData = pypyInstall.findRelease(
+        releases,
+        pypyVersionSpec.pythonVersion,
+        pypyVersionSpec.pypyVersion,
+        architecture
+      );
+
+      if (releaseData) {
+        core.info(
+          `Resolved as PyPy ${releaseData.resolvedPyPyVersion} with Python (${releaseData.resolvedPythonVersion})`
+        );
+        pypyVersionSpec.pythonVersion = releaseData.resolvedPythonVersion;
+        pypyVersionSpec.pypyVersion = releaseData.resolvedPyPyVersion;
+      } else {
+        core.info(
+          `Failed to resolve PyPy ${pypyVersionSpec.pypyVersion} with Python (${pypyVersionSpec.pythonVersion}) from manifest`
+        );
+      }
+    }
+  }
 
   ({installDir, resolvedPythonVersion, resolvedPyPyVersion} = findPyPyToolCache(
     pypyVersionSpec.pythonVersion,
@@ -42,16 +70,33 @@ export async function findPyPyVersion(
     } = await pypyInstall.installPyPy(
       pypyVersionSpec.pypyVersion,
       pypyVersionSpec.pythonVersion,
-      architecture
+      architecture,
+      releases
     ));
   }
 
   const pipDir = IS_WINDOWS ? 'Scripts' : 'bin';
   const _binDir = path.join(installDir, pipDir);
+  const binaryExtension = IS_WINDOWS ? '.exe' : '';
+  const pythonPath = path.join(
+    IS_WINDOWS ? installDir : _binDir,
+    `python${binaryExtension}`
+  );
   const pythonLocation = pypyInstall.getPyPyBinaryPath(installDir);
-  core.exportVariable('pythonLocation', pythonLocation);
-  core.addPath(pythonLocation);
-  core.addPath(_binDir);
+  if (updateEnvironment) {
+    core.exportVariable('pythonLocation', installDir);
+    // https://cmake.org/cmake/help/latest/module/FindPython.html#module:FindPython
+    core.exportVariable('Python_ROOT_DIR', installDir);
+    // https://cmake.org/cmake/help/latest/module/FindPython2.html#module:FindPython2
+    core.exportVariable('Python2_ROOT_DIR', installDir);
+    // https://cmake.org/cmake/help/latest/module/FindPython3.html#module:FindPython3
+    core.exportVariable('Python3_ROOT_DIR', installDir);
+    core.exportVariable('PKG_CONFIG_PATH', pythonLocation + '/lib/pkgconfig');
+    core.addPath(pythonLocation);
+    core.addPath(_binDir);
+  }
+  core.setOutput('python-version', 'pypy' + resolvedPyPyVersion.trim());
+  core.setOutput('python-path', pythonPath);
 
   return {resolvedPyPyVersion, resolvedPythonVersion};
 }
@@ -96,9 +141,14 @@ export function findPyPyToolCache(
 export function parsePyPyVersion(versionSpec: string): IPyPyVersionSpec {
   const versions = versionSpec.split('-').filter(item => !!item);
 
+  if (/^(pypy)(.+)/.test(versions[0])) {
+    let pythonVersion = versions[0].replace('pypy', '');
+    versions.splice(0, 1, 'pypy', pythonVersion);
+  }
+
   if (versions.length < 2 || versions[0] != 'pypy') {
     throw new Error(
-      "Invalid 'version' property for PyPy. PyPy version should be specified as 'pypy-<python-version>'. See README for examples and documentation."
+      "Invalid 'version' property for PyPy. PyPy version should be specified as 'pypy<python-version>' or 'pypy-<python-version>'. See README for examples and documentation."
     );
   }
 

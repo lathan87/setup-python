@@ -1,6 +1,6 @@
 import * as os from 'os';
 import * as path from 'path';
-import {IS_WINDOWS, IS_LINUX} from './utils';
+import {IS_WINDOWS, IS_LINUX, getOSInfo} from './utils';
 
 import * as semver from 'semver';
 
@@ -30,58 +30,36 @@ function binDir(installDir: string): string {
   }
 }
 
-// Note on the tool cache layout for PyPy:
-// PyPy has its own versioning scheme that doesn't follow the Python versioning scheme.
-// A particular version of PyPy may contain one or more versions of the Python interpreter.
-// For example, PyPy 7.0 contains Python 2.7, 3.5, and 3.6-alpha.
-// We only care about the Python version, so we don't use the PyPy version for the tool cache.
-function usePyPy(
-  majorVersion: '2' | '3.6',
-  architecture: string
-): InstalledVersion {
-  const findPyPy = tc.find.bind(undefined, 'PyPy', majorVersion);
-  let installDir: string | null = findPyPy(architecture);
-
-  if (!installDir && IS_WINDOWS) {
-    // PyPy only precompiles binaries for x86, but the architecture parameter defaults to x64.
-    // On our Windows virtual environments, we only install an x86 version.
-    // Fall back to x86.
-    installDir = findPyPy('x86');
-  }
-
-  if (!installDir) {
-    // PyPy not installed in $(Agent.ToolsDirectory)
-    throw new Error(`PyPy ${majorVersion} not found`);
-  }
-
-  // For PyPy, Windows uses 'bin', not 'Scripts'.
-  const _binDir = path.join(installDir, 'bin');
-
-  // On Linux and macOS, the Python interpreter is in 'bin'.
-  // On Windows, it is in the installation root.
-  const pythonLocation = IS_WINDOWS ? installDir : _binDir;
-  core.exportVariable('pythonLocation', pythonLocation);
-
-  core.addPath(installDir);
-  core.addPath(_binDir);
-  // Starting from PyPy 7.3.1, the folder that is used for pip and anything that pip installs should be "Scripts" on Windows.
-  if (IS_WINDOWS) {
-    core.addPath(path.join(installDir, 'Scripts'));
-  }
-
-  const impl = 'pypy' + majorVersion.toString();
-  core.setOutput('python-version', impl);
-
-  return {impl: impl, version: versionFromPath(installDir)};
-}
-
-async function useCpythonVersion(
+export async function useCpythonVersion(
   version: string,
-  architecture: string
+  architecture: string,
+  updateEnvironment: boolean,
+  checkLatest: boolean
 ): Promise<InstalledVersion> {
+  let manifest: tc.IToolRelease[] | null = null;
   const desugaredVersionSpec = desugarDevVersion(version);
-  const semanticVersionSpec = pythonVersionToSemantic(desugaredVersionSpec);
+  let semanticVersionSpec = pythonVersionToSemantic(desugaredVersionSpec);
   core.debug(`Semantic version spec of ${version} is ${semanticVersionSpec}`);
+
+  if (checkLatest) {
+    manifest = await installer.getManifest();
+    const resolvedVersion = (
+      await installer.findReleaseFromManifest(
+        semanticVersionSpec,
+        architecture,
+        manifest
+      )
+    )?.version;
+
+    if (resolvedVersion) {
+      semanticVersionSpec = resolvedVersion;
+      core.info(`Resolved as '${semanticVersionSpec}'`);
+    } else {
+      core.info(
+        `Failed to resolve version ${semanticVersionSpec} from manifest`
+      );
+    }
+  }
 
   let installDir: string | null = tc.find(
     'Python',
@@ -94,7 +72,8 @@ async function useCpythonVersion(
     );
     const foundRelease = await installer.findReleaseFromManifest(
       semanticVersionSpec,
-      architecture
+      architecture,
+      manifest
     );
 
     if (foundRelease && foundRelease.files && foundRelease.files.length > 0) {
@@ -106,62 +85,80 @@ async function useCpythonVersion(
   }
 
   if (!installDir) {
+    const osInfo = await getOSInfo();
     throw new Error(
       [
-        `Version ${version} with arch ${architecture} not found`,
+        `The version '${version}' with architecture '${architecture}' was not found for ${
+          osInfo
+            ? `${osInfo.osName} ${osInfo.osVersion}`
+            : 'this operating system'
+        }.`,
         `The list of all available versions can be found here: ${installer.MANIFEST_URL}`
       ].join(os.EOL)
     );
   }
 
-  core.exportVariable('pythonLocation', installDir);
+  const _binDir = binDir(installDir);
+  const binaryExtension = IS_WINDOWS ? '.exe' : '';
+  const pythonPath = path.join(
+    IS_WINDOWS ? installDir : _binDir,
+    `python${binaryExtension}`
+  );
+  if (updateEnvironment) {
+    core.exportVariable('pythonLocation', installDir);
+    core.exportVariable('PKG_CONFIG_PATH', installDir + '/lib/pkgconfig');
+    core.exportVariable('pythonLocation', installDir);
+    // https://cmake.org/cmake/help/latest/module/FindPython.html#module:FindPython
+    core.exportVariable('Python_ROOT_DIR', installDir);
+    // https://cmake.org/cmake/help/latest/module/FindPython2.html#module:FindPython2
+    core.exportVariable('Python2_ROOT_DIR', installDir);
+    // https://cmake.org/cmake/help/latest/module/FindPython3.html#module:FindPython3
+    core.exportVariable('Python3_ROOT_DIR', installDir);
+    core.exportVariable('PKG_CONFIG_PATH', installDir + '/lib/pkgconfig');
 
-  if (IS_LINUX) {
-    const libPath = process.env.LD_LIBRARY_PATH
-      ? `:${process.env.LD_LIBRARY_PATH}`
-      : '';
-    const pyLibPath = path.join(installDir, 'lib');
+    if (IS_LINUX) {
+      const libPath = process.env.LD_LIBRARY_PATH
+        ? `:${process.env.LD_LIBRARY_PATH}`
+        : '';
+      const pyLibPath = path.join(installDir, 'lib');
 
-    if (!libPath.split(':').includes(pyLibPath)) {
-      core.exportVariable('LD_LIBRARY_PATH', pyLibPath + libPath);
+      if (!libPath.split(':').includes(pyLibPath)) {
+        core.exportVariable('LD_LIBRARY_PATH', pyLibPath + libPath);
+      }
     }
+    core.addPath(installDir);
+    core.addPath(_binDir);
+
+    if (IS_WINDOWS) {
+      // Add --user directory
+      // `installDir` from tool cache should look like $RUNNER_TOOL_CACHE/Python/<semantic version>/x64/
+      // So if `findLocalTool` succeeded above, we must have a conformant `installDir`
+      const version = path.basename(path.dirname(installDir));
+      const major = semver.major(version);
+      const minor = semver.minor(version);
+
+      const userScriptsDir = path.join(
+        process.env['APPDATA'] || '',
+        'Python',
+        `Python${major}${minor}`,
+        'Scripts'
+      );
+      core.addPath(userScriptsDir);
+    }
+    // On Linux and macOS, pip will create the --user directory and add it to PATH as needed.
   }
-
-  core.addPath(installDir);
-  core.addPath(binDir(installDir));
-
-  if (IS_WINDOWS) {
-    // Add --user directory
-    // `installDir` from tool cache should look like $RUNNER_TOOL_CACHE/Python/<semantic version>/x64/
-    // So if `findLocalTool` succeeded above, we must have a conformant `installDir`
-    const version = path.basename(path.dirname(installDir));
-    const major = semver.major(version);
-    const minor = semver.minor(version);
-
-    const userScriptsDir = path.join(
-      process.env['APPDATA'] || '',
-      'Python',
-      `Python${major}${minor}`,
-      'Scripts'
-    );
-    core.addPath(userScriptsDir);
-  }
-  // On Linux and macOS, pip will create the --user directory and add it to PATH as needed.
 
   const installed = versionFromPath(installDir);
   core.setOutput('python-version', installed);
+  core.setOutput('python-path', pythonPath);
 
   return {impl: 'CPython', version: installed};
 }
 
-/** Convert versions like `3.8-dev` to a version like `>= 3.8.0-a0`. */
+/** Convert versions like `3.8-dev` to a version like `~3.8.0-0`. */
 function desugarDevVersion(versionSpec: string) {
-  if (versionSpec.endsWith('-dev')) {
-    const versionRoot = versionSpec.slice(0, -'-dev'.length);
-    return `>= ${versionRoot}.0-a0`;
-  } else {
-    return versionSpec;
-  }
+  const devVersion = /^(\d+)\.(\d+)-dev$/;
+  return versionSpec.replace(devVersion, '~$1.$2.0-0');
 }
 
 /** Extracts python version from install path from hosted tool cache as described in README.md */
@@ -185,19 +182,4 @@ interface InstalledVersion {
 export function pythonVersionToSemantic(versionSpec: string) {
   const prereleaseVersion = /(\d+\.\d+\.\d+)((?:a|b|rc)\d*)/g;
   return versionSpec.replace(prereleaseVersion, '$1-$2');
-}
-
-export async function findPythonVersion(
-  version: string,
-  architecture: string
-): Promise<InstalledVersion> {
-  switch (version.toUpperCase()) {
-    case 'PYPY2':
-      return usePyPy('2', architecture);
-    case 'PYPY3':
-      // keep pypy3 pointing to 3.6 for backward compatibility
-      return usePyPy('3.6', architecture);
-    default:
-      return await useCpythonVersion(version, architecture);
-  }
 }
